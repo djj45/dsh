@@ -1,8 +1,11 @@
 import { EventEmitter } from 'node:events'
+import { createServer, request as httpRequest } from 'node:http'
+import type { AddressInfo } from 'node:net'
 import { Readable } from 'node:stream'
+import { brotliDecompressSync, gunzipSync } from 'node:zlib'
 import type { IncomingMessage, ServerResponse } from 'node:http'
-import { describe, expect, it } from 'vitest'
-import { bridge } from '../src/http-bridge.ts'
+import { afterEach, describe, expect, it } from 'vitest'
+import { bridge, selectContentEncoding } from '../src/http-bridge.ts'
 
 describe('HTTP bridge abort', () => {
   it('destroys a declared-oversize request instead of draining it', async () => {
@@ -210,5 +213,103 @@ describe('HTTP bridge abort', () => {
     expect(status).toBe(415)
     expect(headers).toMatchObject({ connection: 'close' })
     expect(destroyed).toEqual([true])
+  })
+})
+
+describe('HTTP bridge content encoding', () => {
+  const servers: ReturnType<typeof createServer>[] = []
+  afterEach(async () => {
+    await Promise.all(servers.splice(0).map(server => new Promise<void>((resolve, reject) => {
+      server.close((error) => {
+        if (error === undefined) resolve()
+        else reject(error)
+      })
+    })))
+  })
+
+  async function start(handler: (req: IncomingMessage, res: ServerResponse) => Promise<void>): Promise<number> {
+    const server = createServer((req, res) => {
+      handler(req, res).catch((error: unknown) => {
+        res.destroy(error instanceof Error ? error : new Error(String(error)))
+      })
+    })
+    servers.push(server)
+    await new Promise<void>((resolve, reject) => {
+      server.once('error', reject)
+      server.listen(0, '127.0.0.1', () => {
+        server.off('error', reject)
+        resolve()
+      })
+    })
+    return (server.address() as AddressInfo).port
+  }
+
+  async function post(port: number, acceptEncoding: string): Promise<{ headers: IncomingMessage['headers']; body: Buffer }> {
+    return new Promise((resolve, reject) => {
+      const req = httpRequest({
+        host: '127.0.0.1',
+        port,
+        path: '/api/session.list',
+        method: 'POST',
+        headers: { 'accept-encoding': acceptEncoding, 'content-type': 'application/json' },
+      }, (res) => {
+        const chunks: Buffer[] = []
+        res.on('data', (chunk: Buffer) => { chunks.push(chunk) })
+        res.on('end', () => { resolve({ headers: res.headers, body: Buffer.concat(chunks) }) })
+      })
+      req.on('error', reject)
+      req.end('{}')
+    })
+  }
+
+  it('gzip-compresses a JSON API response and announces the coding', async () => {
+    const payload = 'x'.repeat(4096)
+    const port = await start(async (req, res) => {
+      await bridge(req, res, { requestBodyMode: () => 'buffered', fetch: async () => Response.json({ payload }) })
+    })
+    const { headers, body } = await post(port, 'gzip')
+    expect(headers['content-encoding']).toBe('gzip')
+    expect(headers.vary).toContain('Accept-Encoding')
+    expect(JSON.parse(gunzipSync(body).toString())).toEqual({ payload })
+  })
+
+  it('brotli-compresses when brotli is the only accepted coding', async () => {
+    const payload = 'y'.repeat(4096)
+    const port = await start(async (req, res) => {
+      await bridge(req, res, { requestBodyMode: () => 'buffered', fetch: async () => Response.json({ payload }) })
+    })
+    const { headers, body } = await post(port, 'br')
+    expect(headers['content-encoding']).toBe('br')
+    expect(JSON.parse(brotliDecompressSync(body).toString())).toEqual({ payload })
+  })
+
+  it('keeps streaming event channels uncompressed', async () => {
+    const frame = 'data: {"type":"stream/error"}\n\n'
+    const port = await start(async (req, res) => {
+      await bridge(req, res, {
+        requestBodyMode: () => 'buffered',
+        fetch: async () => new Response(frame, { headers: { 'content-type': 'text/event-stream' } }),
+      })
+    })
+    const { headers, body } = await post(port, 'gzip')
+    expect(headers['content-encoding']).toBeUndefined()
+    expect(body.toString()).toBe(frame)
+  })
+})
+
+describe('selectContentEncoding', () => {
+  it('negotiates q-values and prefers gzip on ties', () => {
+    expect(selectContentEncoding('gzip, br', 'application/json', undefined)).toBe('gzip')
+    expect(selectContentEncoding('gzip;q=0, br;q=0.5', 'application/json', undefined)).toBe('br')
+    expect(selectContentEncoding('*', 'application/json; charset=utf-8', undefined)).toBe('gzip')
+    expect(selectContentEncoding('br', 'application/json', undefined)).toBe('br')
+  })
+
+  it('skips unsupported, disabled, streaming, and small responses', () => {
+    expect(selectContentEncoding(undefined, 'application/json', undefined)).toBeUndefined()
+    expect(selectContentEncoding('gzip;q=0', 'application/json', undefined)).toBeUndefined()
+    expect(selectContentEncoding('gzip', 'text/event-stream', undefined)).toBeUndefined()
+    expect(selectContentEncoding('gzip', 'application/json', '512')).toBeUndefined()
+    expect(selectContentEncoding('gzip', 'application/octet-stream', undefined)).toBeUndefined()
   })
 })
