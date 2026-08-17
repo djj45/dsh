@@ -5,6 +5,8 @@
 
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import { Readable } from 'node:stream'
+import { pipeline } from 'node:stream/promises'
+import { constants as zlibConstants, createBrotliCompress, createGzip } from 'node:zlib'
 import type { ConnectionFetchHandler } from './rpc.ts'
 
 /** Default carrier cap for all HTTP RPC bodies: sized for the default
@@ -12,6 +14,70 @@ import type { ConnectionFetchHandler } from './rpc.ts'
  * headroom (~267.7 MiB required), rounded up for slack. The bridge buffers
  * each body in memory, so this cap is also the per-request resident bound. */
 export const DEFAULT_MAX_REQUEST_BODY_BYTES = 300 * 1024 * 1024
+
+/** Content types the API bridge compresses; streaming event channels stay raw. */
+const COMPRESSIBLE_CONTENT_TYPES = new Set([
+  'application/json',
+  'application/javascript',
+  'application/xml',
+  'image/svg+xml',
+  'text/css',
+  'text/html',
+  'text/javascript',
+  'text/plain',
+  'text/xml',
+])
+
+/** Small responses are cheaper to send raw than to gzip and announce. */
+const MIN_COMPRESS_BYTES = 1024
+
+/**
+ * Choose the response content coding the bridge may apply. Gzip wins ties:
+ * it is universal, fast on the host, and within a few percent of Brotli for
+ * the JSON transcripts this carrier mostly ships.
+ * @param acceptEncoding - request `accept-encoding` value (or values).
+ * @param contentType - response `content-type` value.
+ * @param contentLength - response `content-length` value, when declared.
+ * @returns the negotiated content coding, or undefined when none applies.
+ */
+export function selectContentEncoding(
+  acceptEncoding: string | string[] | undefined,
+  contentType: string | null | undefined,
+  contentLength: string | null | undefined,
+): 'gzip' | 'br' | undefined {
+  if (acceptEncoding === undefined) return undefined
+  const type = (contentType ?? '').split(';', 1)[0]?.trim().toLowerCase() ?? ''
+  if (!COMPRESSIBLE_CONTENT_TYPES.has(type)) return undefined
+  if (contentLength !== undefined && contentLength !== null) {
+    const length = Number(contentLength)
+    if (Number.isFinite(length) && length < MIN_COMPRESS_BYTES) return undefined
+  }
+  let gzip = 0
+  let br = 0
+  let any = 0
+  for (const raw of [acceptEncoding].flat()) {
+    for (const entry of raw.split(',')) {
+      const [rawName = '', ...params] = entry.trim().split(';').map(part => part.trim())
+      const name = rawName.toLowerCase()
+      let q = 1
+      for (const param of params) {
+        const [rawKey = '', rawValue = ''] = param.split('=')
+        if (rawKey.trim().toLowerCase() === 'q') {
+          const parsed = Number(rawValue.trim())
+          if (Number.isFinite(parsed)) q = parsed
+        }
+      }
+      if (q <= 0) continue
+      if (name === 'gzip') gzip = Math.max(gzip, q)
+      else if (name === 'br') br = Math.max(br, q)
+      else if (name === '*') any = Math.max(any, q)
+    }
+  }
+  gzip = Math.max(gzip, any)
+  br = Math.max(br, any)
+  if (gzip <= 0 && br <= 0) return undefined
+  return gzip >= br ? 'gzip' : 'br'
+}
 
 /**
  * Bridge one node:http request to the fetch-shaped handler (client close
@@ -83,7 +149,30 @@ export async function bridge(
   const response = await apiHandler.fetch(request)
   const requestUnread = bodyMode === 'streaming' && !req.readableEnded
   const responseHeaders = Object.fromEntries(response.headers.entries())
-  res.writeHead(response.status, requestUnread ? { ...responseHeaders, connection: 'close' } : responseHeaders)
+  if (requestUnread) responseHeaders.connection = 'close'
+  const contentEncoding = responseHeaders['content-encoding'] === undefined
+    ? selectContentEncoding(req.headers['accept-encoding'], responseHeaders['content-type'], responseHeaders['content-length'])
+    : undefined
+  if (response.body !== null && contentEncoding !== undefined) {
+    delete responseHeaders['content-length']
+    responseHeaders['content-encoding'] = contentEncoding
+    responseHeaders.vary = responseHeaders.vary === undefined || responseHeaders.vary.trim() === ''
+      ? 'Accept-Encoding'
+      : `${responseHeaders.vary}, Accept-Encoding`
+    res.writeHead(response.status, responseHeaders)
+    // Undici's `ReadableStream<Uint8Array>` and Node's stream/web generic
+    // disagree on the ArrayBufferLike variance; the body is the same stream.
+    const source = Readable.fromWeb(response.body as unknown as Parameters<typeof Readable.fromWeb>[0])
+    // Brotli's default quality (11) costs seconds on megabyte payloads; q4
+    // still beats gzip on size while keeping host CPU comparable to it.
+    const compressor = contentEncoding === 'gzip'
+      ? createGzip()
+      : createBrotliCompress({ params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 4 } })
+    await pipeline(source, compressor, res)
+    if (requestUnread) req.destroy()
+    return
+  }
+  res.writeHead(response.status, responseHeaders)
   if (response.body === null) {
     res.end()
     if (requestUnread) req.destroy()
