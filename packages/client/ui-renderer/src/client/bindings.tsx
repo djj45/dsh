@@ -137,7 +137,20 @@ export function ScopeProvider({
   const host = useHost()
   observableHook(host.scopeRevision)(value => value)
   const adapter = host.scope(scope)
-  if (adapter === undefined) throw new SlotAssemblyError(`scope '${scope}' rendered without an installed adapter`)
-  const binding = observableHook(adapter.current)(value => value)
+  // WebKit's first paint can run before the roster has installed the adapter
+  // or before its proxied observable has synced the binding snapshot. Bind
+  // through the absent source either way so the Hook call order stays
+  // identical across those ticks — an early return before the binding hook
+  // makes the later adapter-installed render call one hook more and trips
+  // React's "rendered more hooks" (#300). Skipping the tick instead is safe:
+  // rendering the optional scope with `undefined` throws deep in
+  // standardProps and unmounts the whole conversation tree, while the roster
+  // revision emission re-renders with the real binding.
+  const binding = maybeObservableHook(adapter?.current)(value => value)
+  if (adapter === undefined) {
+    if (scope === 'session-maybe') return null
+    throw new SlotAssemblyError(`scope '${scope}' rendered without an installed adapter`)
+  }
+  if (binding === undefined) return null
   return <ScopeBindingContext.Provider value={binding}>{children}</ScopeBindingContext.Provider>
 }

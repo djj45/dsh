@@ -472,6 +472,18 @@ export class Session implements SessionFace {
   // ---- Subscription API (useSyncExternalStore direct wiring) ----
 
   /**
+   * Watchdog nudge: re-notify subscribers even without a tracked mutation.
+   * WebKit can drop the scheduled microtask/frame notification after a
+   * journal window install, leaving React on a stale empty snapshot while
+   * the store itself already holds the entries; a periodic nudge makes the
+   * next read visible. uSES de-duplicates identical snapshots, so this is a
+   * no-op when nothing changed.
+   */
+  nudge(): void {
+    this.notifier.markDirty()
+  }
+
+  /**
    * uSES subscription entry.
    * @param listener - change callback.
    * @returns the unsubscribe function.
