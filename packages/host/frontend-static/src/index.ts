@@ -101,7 +101,15 @@ export async function serveStatic(
     res.end()
     return
   }
-  res.writeHead(200, { 'content-type': type })
+  // Cache policy: the app shell must always revalidate (a stale index pins
+  // every visitor to a retired asset graph after an update), while the
+  // content-hashed /assets/ graph is immutable by construction.
+  const headers: Record<string, string> = { 'content-type': type }
+  headers['cache-control'] = (target === distRoot || target === distIndex)
+    || !pathname.startsWith('/assets/')
+    ? 'no-cache'
+    : 'public, max-age=31536000, immutable'
+  res.writeHead(200, headers)
   res.end(body)
 }
 

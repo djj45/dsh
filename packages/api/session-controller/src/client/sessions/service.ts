@@ -259,7 +259,17 @@ export class ClientSessions implements ISessions {
       ids: [], byId: {}, phase: 'pending', projectionsBySession: {},
     })
     const disposeManagerProjection = this.manager.subscribe(() => { this.projectList() })
+    // Self-heal watchdog: WebKit can drop the scheduled microtask/frame
+    // notification after a journal window install, leaving React on a stale
+    // snapshot while the store already holds the entries; a periodic nudge
+    // re-notifies the retained scopes so the next read is visible.
+    const scopeWatchdog = setInterval(() => {
+      try {
+        for (const record of this.scopes.values()) record.session.nudge()
+      } catch { /* timer must never throw */ }
+    }, 2000)
     rootCtx.effect(() => async () => {
+      clearInterval(scopeWatchdog)
       this.closed = true
       disposeManagerProjection()
       const scopes = [...this.scopes]

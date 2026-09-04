@@ -759,7 +759,11 @@ function finishReasonValue(value: SessionFormatJsonValue | undefined, label: str
 }
 
 function replayEnvelopeValue(value: SessionFormatJsonValue | undefined, label: string): void {
-  const replay = exactRecord(value, label, ['response'], ['blocks'])
+  // Legacy v0 writers stored the full provider replay envelope (kind/version/
+  // api/provider/model/responseId/stopReason) rather than {response, blocks?};
+  // conversion drops this metadata entirely, so tolerate any record shape and
+  // keep only the structural check that survives into v1.
+  const replay = releasedV0Record(value, label)
   if (replay['blocks'] !== undefined && !Array.isArray(replay['blocks'])) {
     throw new SessionFormatError(`${label} blocks must be an array`)
   }
