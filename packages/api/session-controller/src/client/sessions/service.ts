@@ -211,6 +211,7 @@ export class ClientSessions implements ISessions {
    * keep the staged scope's frozen view alive until the stage moves on).
    */
   private watched: SessionId | undefined
+
   /** Removed-while-staged sessions whose teardown waits for the stage to move away. */
   private readonly deferredRemovals = new Set<SessionId>()
 
@@ -249,7 +250,19 @@ export class ClientSessions implements ISessions {
     const disposeStageFollower = this.list.subscribe(() => {
       this.followCurrent()
     })
+    // Self-heal watchdog: a dropped notification edge (observed on WebKit)
+    // leaves the stage stuck on a retired session and the chat blank even
+    // though `current` moved; polling repairs the stage without depending
+    // on any single notify path. followCurrent is idempotent.
+    const stageWatchdog = setInterval(() => {
+      try {
+        this.followCurrent()
+        const staged = this.watched === undefined ? undefined : this.resolve(this.watched)
+        staged?.session.nudge()
+      } catch { /* timer must never throw */ }
+    }, 2000)
     rootCtx.effect(() => async () => {
+      clearInterval(stageWatchdog)
       disposeStageFollower()
       disposeManagerProjection()
       const scopes = [...this.scopes]

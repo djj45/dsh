@@ -79,6 +79,18 @@ function setDelete<T>(target: Set<T>, value: T): void {
   intrinsicReflectApply(intrinsicSetDelete, target, [value])
 }
 
+/**
+ * Engine-portable native-constructor source: V8 renders the spec's
+ * NativeFunction toString on one line, JavaScriptCore and SpiderMonkey
+ * across three (`function Object() {\n    [native code]\n}`); the grammar
+ * permits any whitespace between the tokens, so anchor the shape rather
+ * than V8's exact spacing.
+ */
+const NATIVE_CONSTRUCTOR_SOURCE: Record<'Array' | 'Object', RegExp> = {
+  Array: /^function\s+Array\s*\(\s*\)\s*\{\s*\[native code\]\s*\}$/,
+  Object: /^function\s+Object\s*\(\s*\)\s*\{\s*\[native code\]\s*\}$/,
+}
+
 /** Whether a realm-owned intrinsic prototype is backed by its native constructor. */
 function hasIntrinsicConstructor(prototype: object, name: 'Array' | 'Object'): boolean {
   const descriptor = intrinsicObjectGetOwnPropertyDescriptor(prototype, 'constructor')
@@ -87,7 +99,9 @@ function hasIntrinsicConstructor(prototype: object, name: 'Array' | 'Object'): b
   try {
     return constructor.name === name
       && constructor.prototype === prototype
-      && intrinsicReflectApply(intrinsicFunctionToString, constructor, []) === `function ${name}() { [native code] }`
+      && NATIVE_CONSTRUCTOR_SOURCE[name].test(
+        intrinsicReflectApply(intrinsicFunctionToString, constructor, []) as string,
+      )
   } catch {
     return false
   }
