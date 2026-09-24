@@ -5,6 +5,7 @@
 
 import type { IncomingMessage } from 'node:http'
 import { Readable } from 'node:stream'
+import type { Writable } from 'node:stream'
 import { pipeline } from 'node:stream/promises'
 import { constants as zlibConstants, createBrotliCompress, createGzip } from 'node:zlib'
 import type { ConnectionFetchHandler } from './rpc.ts'
@@ -178,7 +179,9 @@ export async function bridge(
     const compressor = contentEncoding === 'gzip'
       ? createGzip()
       : createBrotliCompress({ params: { [zlibConstants.BROTLI_PARAM_QUALITY]: 4 } })
-    await pipeline(source, compressor, res)
+    // `res` is a real ServerResponse, but this module only names the members it
+    // uses; the node:stream/promises overloads want the full Writable surface.
+    await pipeline(source, compressor, res as unknown as Writable)
     if (requestUnread) req.destroy()
     return
   }
