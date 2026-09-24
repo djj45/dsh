@@ -134,13 +134,13 @@ export class RepositoryCleaner {
       const parsed = parseConfig(configPath)
       if (parsed.options.outDir !== undefined) {
         const typesDirectory = resolve(parsed.options.outDir)
-        const outputDirectory = basename(typesDirectory) === 'types'
+        const outputDirectory = basename(typesDirectory).endsWith('types')
           ? dirname(typesDirectory)
           : typesDirectory === nativeEntryOutput
             ? typesDirectory
             : undefined
         if (outputDirectory === undefined) {
-          throw new Error(`clean: expected TypeScript outDir to end in /types: ${repositoryPath(this.root, typesDirectory)}`)
+          throw new Error(`clean: expected TypeScript outDir to end in types: ${repositoryPath(this.root, typesDirectory)}`)
         }
         this.assertRepositoryTarget(outputDirectory)
         outputs.add(outputDirectory)
